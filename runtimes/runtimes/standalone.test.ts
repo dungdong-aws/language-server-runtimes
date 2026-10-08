@@ -15,7 +15,6 @@ import * as baseChatModule from './chat/baseChat'
 import { pathToFileURL } from 'url'
 import fsPromises from 'fs/promises'
 import { didWriteFileNotificationType, didAppendFileNotificationType } from '../protocol'
-import * as guardedFile from './util/standalone/guardedFile'
 
 describe('standalone', () => {
     let stubServer: sinon.SinonStub
@@ -142,8 +141,12 @@ describe('standalone', () => {
         describe('Workspace', () => {
             describe('existing filesystem compatibility', () => {
                 beforeEach(() => {
-                    sinon.stub(guardedFile, 'readFileNoFollow').rejects(new Error('Unexpected guarded read'))
-                    sinon.stub(guardedFile, 'updateFileNoFollow').rejects(new Error('Unexpected guarded update'))
+                    features.workspace.fs.checkedFiles = {
+                        version: 1,
+                        capture: sinon.stub().rejects(new Error('Unexpected capture')),
+                        read: sinon.stub().rejects(new Error('Unexpected guarded read')),
+                        update: sinon.stub().rejects(new Error('Unexpected guarded update')),
+                    }
                 })
 
                 it('preserves readFile defaults and encoding options', async () => {
@@ -190,17 +193,12 @@ describe('standalone', () => {
 
                 it('accepts providers that implement only the existing filesystem API', async () => {
                     const methods = { ...features.workspace.fs }
-                    delete methods.readFileNoFollow
-                    delete methods.updateFileNoFollow
-                    const previousProvider: Omit<
-                        Features['workspace']['fs'],
-                        'readFileNoFollow' | 'updateFileNoFollow'
-                    > = methods
+                    delete methods.checkedFiles
+                    const previousProvider: Omit<Features['workspace']['fs'], 'checkedFiles'> = methods
                     const compatibleProvider: Features['workspace']['fs'] = previousProvider
                     sinon.stub(fsPromises, 'readFile').resolves('fixture')
                     assert.strictEqual(await compatibleProvider.readFile('/workspace/file.txt'), 'fixture')
-                    assert.strictEqual(compatibleProvider.readFileNoFollow, undefined)
-                    assert.strictEqual(compatibleProvider.updateFileNoFollow, undefined)
+                    assert.strictEqual(compatibleProvider.checkedFiles, undefined)
                 })
 
                 it('preserves existing read and write behavior for file aliases', async function () {
@@ -231,82 +229,81 @@ describe('standalone', () => {
                     }
                 })
             })
-
-            describe('guarded file operations', () => {
-                it('emits the same write notification after the guarded update completes', async () => {
-                    const write = sinon.stub(fsPromises, 'writeFile').resolves()
-                    const notify = stubConnection.sendNotification as sinon.SinonStub
-                    notify.resolves()
-                    const file = path.join(os.tmpdir(), 'example file.txt')
-                    await features.workspace.fs.writeFile(file, 'content')
-                    const existingEvent = notify.lastCall.args
-                    write.resetHistory()
-                    notify.resetHistory()
-                    let finish!: () => void
-                    const update = sinon.stub(guardedFile, 'updateFileNoFollow').returns(
-                        new Promise<void>(resolve => {
-                            finish = resolve
-                        })
+            ;(process.platform !== 'win32' ? describe : describe.skip)('guarded file operations', () => {
+                let directory: string
+                let file: string
+                beforeEach(async () => {
+                    directory = await fsPromises.realpath(
+                        await fsPromises.mkdtemp(path.join(os.tmpdir(), 'standalone-fs-'))
                     )
-                    const transform = (text: string) => text + ' updated'
-                    const options = { create: true }
-                    const result = features.workspace.fs.updateFileNoFollow!(file, transform, options)
-                    sinon.assert.notCalled(notify)
-                    finish()
-                    await result
-                    sinon.assert.calledOnceWithExactly(update, file, transform, options, features.logging)
-                    sinon.assert.notCalled(write)
-                    sinon.assert.calledOnceWithExactly(notify, didWriteFileNotificationType.method, { path: file })
-                    assert.deepStrictEqual(notify.firstCall.args, existingEvent)
+                    file = path.join(directory, 'example file.txt')
+                    await fsPromises.writeFile(file, 'before')
+                    ;(stubConnection.sendNotification as sinon.SinonStub).resolves()
+                })
+                afterEach(async () => {
+                    await fsPromises.rm(directory, { recursive: true, force: true })
                 })
 
-                it('preserves filesystem path spelling in notifications', async () => {
-                    sinon.stub(guardedFile, 'updateFileNoFollow').resolves()
-                    const notify = stubConnection.sendNotification as sinon.SinonStub
-                    notify.resolves()
-                    for (const file of [
-                        '/workspace/a b.txt',
-                        'C:\\workspace\\a b.txt',
-                        '\\\\server\\share\\file.txt',
-                    ]) {
-                        notify.resetHistory()
-                        await features.workspace.fs.updateFileNoFollow!(file, () => '')
-                        sinon.assert.calledOnceWithExactly(notify, didWriteFileNotificationType.method, { path: file })
-                    }
+                it('uses actual checked I/O and the existing write notification', async () => {
+                    const operations = features.workspace.fs.checkedFiles!
+                    const target = await operations.capture(file)
+                    assert.strictEqual(await operations.read(target), 'before')
+                    sinon.assert.notCalled(stubConnection.sendNotification)
+                    const outcome = await operations.update(target, text => text + ' after')
+                    assert.strictEqual(outcome.complete, true)
+                    assert.strictEqual(await fsPromises.readFile(file, 'utf8'), 'before after')
+                    sinon.assert.calledOnceWithExactly(
+                        stubConnection.sendNotification,
+                        didWriteFileNotificationType.method,
+                        { path: file }
+                    )
                 })
 
-                it('does not notify or fall back when the guarded update fails', async () => {
-                    const failure = new Error('Update failed')
-                    sinon.stub(guardedFile, 'updateFileNoFollow').rejects(failure)
-                    const write = sinon.stub(fsPromises, 'writeFile').resolves()
+                it('does not notify or use legacy writes after identity rejection', async () => {
+                    const operations = features.workspace.fs.checkedFiles!
+                    const target = await operations.capture(file)
+                    await fsPromises.rename(file, path.join(directory, 'original.txt'))
+                    await fsPromises.writeFile(file, 'replacement')
+                    const write = sinon.spy(fsPromises, 'writeFile')
                     await assert.rejects(
-                        features.workspace.fs.updateFileNoFollow!('/workspace/file.txt', () => ''),
-                        failure
+                        operations.update(target, () => 'changed'),
+                        { code: 'ESTALE' }
                     )
-                    sinon.assert.notCalled(stubConnection.sendNotification)
                     sinon.assert.notCalled(write)
-                })
-
-                it('does not turn a completed write into a retry when notification delivery fails', async () => {
-                    const update = sinon.stub(guardedFile, 'updateFileNoFollow').resolves()
-                    ;(stubConnection.sendNotification as sinon.SinonStub).rejects(new Error('Connection closed'))
-                    await features.workspace.fs.updateFileNoFollow!('/workspace/file.txt', () => '')
-                    sinon.assert.calledOnce(update)
-                    sinon.assert.calledOnce(stubConnection.sendNotification)
-                })
-
-                it('does not wait for client transport after the file update finishes', async () => {
-                    sinon.stub(guardedFile, 'updateFileNoFollow').resolves()
-                    ;(stubConnection.sendNotification as sinon.SinonStub).returns(new Promise<void>(() => {}))
-                    await features.workspace.fs.updateFileNoFollow!('/workspace/file.txt', () => '')
-                    sinon.assert.calledOnce(stubConnection.sendNotification)
-                })
-
-                it('reads through the guarded helper without sending a write notification', async () => {
-                    const read = sinon.stub(guardedFile, 'readFileNoFollow').resolves('fixture')
-                    assert.strictEqual(await features.workspace.fs.readFileNoFollow!('/workspace/file.txt'), 'fixture')
-                    sinon.assert.calledOnceWithExactly(read, '/workspace/file.txt', features.logging)
                     sinon.assert.notCalled(stubConnection.sendNotification)
+                    assert.strictEqual(await fsPromises.readFile(file, 'utf8'), 'replacement')
+                })
+
+                it('refreshes after a real write followed by a close failure', async () => {
+                    const operations = features.workspace.fs.checkedFiles!
+                    const target = await operations.capture(file)
+                    const handle = await fsPromises.open(file, 'r+')
+                    const close = handle.close.bind(handle)
+                    sinon.stub(fsPromises, 'open').resolves(handle)
+                    sinon.stub(handle, 'close').callsFake(async () => {
+                        await close()
+                        throw Object.assign(new Error('Close failed'), { code: 'EIO' })
+                    })
+                    await assert.rejects(
+                        operations.update(target, () => 'after'),
+                        { code: 'EIO' }
+                    )
+                    assert.strictEqual(await fsPromises.readFile(file, 'utf8'), 'after')
+                    sinon.assert.calledOnceWithExactly(
+                        stubConnection.sendNotification,
+                        didWriteFileNotificationType.method,
+                        { path: file }
+                    )
+                })
+
+                it('does not fail or wait on a failed or pending notification transport', async () => {
+                    const operations = features.workspace.fs.checkedFiles!
+                    const target = await operations.capture(file)
+                    ;(stubConnection.sendNotification as sinon.SinonStub).rejects(new Error('Connection closed'))
+                    assert.strictEqual((await operations.update(target, () => 'first')).complete, true)
+                    ;(stubConnection.sendNotification as sinon.SinonStub).returns(new Promise<void>(() => {}))
+                    assert.strictEqual((await operations.update(target, () => 'second')).complete, true)
+                    sinon.assert.calledTwice(stubConnection.sendNotification)
                 })
             })
 

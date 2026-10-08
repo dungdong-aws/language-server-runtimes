@@ -1,6 +1,13 @@
-import { constants } from 'fs'
-import { open, FileHandle } from 'fs/promises'
+import { constants, BigIntStats } from 'fs'
+import { open, lstat, FileHandle } from 'fs/promises'
 import { Logging } from '../../../server-interface/logging'
+import {
+    CheckedFileOperations,
+    CheckedFileTarget,
+    ExistingFileTarget,
+    FileUpdateError,
+    FileUpdateOutcome,
+} from '../../../server-interface/checkedFile'
 
 type DebugLogger = Pick<Logging, 'debug'>
 
@@ -27,6 +34,45 @@ export function logFileAccess(
     }
 }
 
+function fileError(code: string, message: string): NodeJS.ErrnoException {
+    return Object.assign(new Error(message), { code })
+}
+
+function existingTarget(path: string, stat: BigIntStats): ExistingFileTarget {
+    if (!stat.isFile()) {
+        throw fileError(
+            stat.isSymbolicLink() ? 'ELOOP' : stat.isDirectory() ? 'EISDIR' : 'EINVAL',
+            'Expected a regular file'
+        )
+    }
+    return Object.freeze({
+        path,
+        state: 'existing',
+        dev: String(stat.dev),
+        ino: String(stat.ino),
+        linkCount: String(stat.nlink),
+    })
+}
+
+async function capture(path: string): Promise<CheckedFileTarget> {
+    try {
+        return existingTarget(path, await lstat(path, { bigint: true }))
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        return Object.freeze({ path, state: 'missing' })
+    }
+}
+
+function verify(expected: ExistingFileTarget, actual: ExistingFileTarget): void {
+    if (
+        actual.dev !== expected.dev ||
+        actual.ino !== expected.ino ||
+        BigInt(actual.linkCount) > BigInt(expected.linkCount)
+    ) {
+        throw fileError('ESTALE', 'The file changed since it was checked. Review it before trying again.')
+    }
+}
+
 async function closeFile(handle: FileHandle, path: string, logging?: DebugLogger, operationFailed = false) {
     const fd = handle.fd
     try {
@@ -38,84 +84,130 @@ async function closeFile(handle: FileHandle, path: string, logging?: DebugLogger
     }
 }
 
-async function openRegularFile(path: string, flags: number, logging?: DebugLogger): Promise<FileHandle> {
-    let handle: FileHandle
+async function openRegularFile(
+    target: CheckedFileTarget,
+    flags: number,
+    logging: DebugLogger | undefined,
+    opened?: () => void
+): Promise<{ handle: FileHandle; actual: ExistingFileTarget }> {
+    const handle = await open(target.path, flags | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    opened?.()
+    logFileAccess(logging, 'open.completed', target.path, handle.fd)
     try {
-        if (process.platform === 'win32' || !constants.O_NOFOLLOW) {
-            throw Object.assign(new Error('This file operation is unavailable on this platform'), { code: 'ENOTSUP' })
-        }
-        handle = await open(path, flags | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+        const actual = existingTarget(target.path, await handle.stat({ bigint: true }))
+        if (target.state === 'existing') verify(target, actual)
+        else if (actual.linkCount !== '1') throw fileError('ESTALE', 'The new file changed before it could be written.')
+        logFileAccess(logging, 'handle.checked', target.path, handle.fd)
+        return { handle, actual }
     } catch (error) {
-        logFileAccess(logging, 'open.failed', path, undefined, error)
-        throw error
-    }
-    logFileAccess(logging, 'open.completed', path, handle.fd)
-    try {
-        const stat = await handle.stat()
-        if (!stat.isFile()) {
-            throw Object.assign(new Error('Expected a regular file'), {
-                code: stat.isDirectory() ? 'EISDIR' : 'EINVAL',
-            })
-        }
-        logFileAccess(logging, 'handle.checked', path, handle.fd)
-        return handle
-    } catch (error) {
-        await closeFile(handle, path, logging, true)
+        await closeFile(handle, target.path, logging, true)
         throw error
     }
 }
 
-export async function readFileNoFollow(path: string, logging?: DebugLogger): Promise<string> {
-    const handle = await openRegularFile(path, constants.O_RDONLY, logging)
+async function read(target: CheckedFileTarget, logging?: DebugLogger): Promise<string> {
+    if (target.state === 'missing') throw fileError('ENOENT', `No such file or directory: ${target.path}`)
+    const { handle } = await openRegularFile(target, constants.O_RDONLY, logging)
     let failed = false
     try {
         const content = await handle.readFile({ encoding: 'utf8' })
-        logFileAccess(logging, 'read.completed', path, handle.fd)
+        logFileAccess(logging, 'read.completed', target.path, handle.fd)
         return content
     } catch (error) {
         failed = true
-        logFileAccess(logging, 'read.failed', path, handle.fd, error)
         throw error
     } finally {
-        await closeFile(handle, path, logging, failed)
+        await closeFile(handle, target.path, logging, failed)
     }
 }
 
-export async function updateFileNoFollow(
-    path: string,
+async function update(
+    target: CheckedFileTarget,
     transform: (content: string) => string,
     options: { create?: boolean; readExisting?: boolean } = {},
     logging?: DebugLogger
-): Promise<void> {
-    let handle: FileHandle
+): Promise<FileUpdateOutcome> {
+    let mayHaveChanged = false
+    let actual: ExistingFileTarget | undefined
     try {
-        handle = await openRegularFile(
-            path,
-            options.readExisting === false ? constants.O_WRONLY : constants.O_RDWR,
-            logging
-        )
-    } catch (error) {
-        if (!options.create || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-        handle = await openRegularFile(path, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL, logging)
-    }
-    let failed = false
-    try {
-        const previous = options.readExisting === false ? '' : await handle.readFile({ encoding: 'utf8' })
-        const content = Buffer.from(transform(previous), 'utf8')
-        // Reading advances the handle offset; replacement writes use explicit positions.
-        let offset = 0
-        while (offset < content.length) {
-            const { bytesWritten } = await handle.write(content, offset, content.length - offset, offset)
-            if (bytesWritten === 0) throw new Error('File write made no progress')
-            offset += bytesWritten
+        const creating = target.state === 'missing'
+        if (creating && !options.create) throw fileError('ENOENT', `No such file or directory: ${target.path}`)
+        // Transform new content before creating an entry, so a rejected edit creates nothing.
+        const newContent = creating ? Buffer.from(transform(''), 'utf8') : undefined
+        const flags = creating
+            ? constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL
+            : options.readExisting === false
+              ? constants.O_WRONLY
+              : constants.O_RDWR
+        const opened = await openRegularFile(target, flags, logging, () => {
+            mayHaveChanged = creating
+        })
+        const handle = opened.handle
+        actual = opened.actual
+        let failed = false
+        try {
+            const content =
+                newContent ??
+                Buffer.from(
+                    transform(options.readExisting === false ? '' : await handle.readFile({ encoding: 'utf8' })),
+                    'utf8'
+                )
+            // Transformations run before mutation; writes retain the opened object and use explicit positions.
+            let offset = 0
+            while (offset < content.length) {
+                mayHaveChanged = true
+                const { bytesWritten } = await handle.write(content, offset, content.length - offset, offset)
+                if (bytesWritten === 0) throw fileError('EIO', 'File write made no progress')
+                offset += bytesWritten
+            }
+            mayHaveChanged = true
+            await handle.truncate(content.length)
+            logFileAccess(logging, 'update.completed', target.path, handle.fd)
+        } catch (error) {
+            failed = true
+            throw error
+        } finally {
+            await closeFile(handle, target.path, logging, failed)
         }
-        await handle.truncate(content.length)
-        logFileAccess(logging, 'update.completed', path, handle.fd)
+        return Object.freeze({ mayHaveChanged, complete: true, target: actual })
     } catch (error) {
-        failed = true
-        logFileAccess(logging, 'update.failed', path, handle.fd, error)
-        throw error
-    } finally {
-        await closeFile(handle, path, logging, failed)
+        logFileAccess(logging, 'update.failed', target.path, undefined, error)
+        throw new FileUpdateError(error, Object.freeze({ mayHaveChanged, complete: false, target: actual }))
     }
+}
+
+/** Shared by the standalone provider and filesystem integration fixtures. */
+export function createCheckedFileOperations(
+    logging?: DebugLogger,
+    didChange?: (path: string) => void | Promise<void>
+): CheckedFileOperations | undefined {
+    if (process.platform === 'win32' || !constants.O_NOFOLLOW) return undefined
+    const notify = (path: string) => {
+        try {
+            void Promise.resolve(didChange?.(path)).catch(error =>
+                logFileAccess(logging, 'notification.failed', path, undefined, error)
+            )
+        } catch (error) {
+            logFileAccess(logging, 'notification.failed', path, undefined, error)
+        }
+    }
+    return Object.freeze({
+        version: 1,
+        capture,
+        read: (target: CheckedFileTarget) => read(target, logging),
+        update: async (
+            target: CheckedFileTarget,
+            transform: (content: string) => string,
+            options?: { create?: boolean; readExisting?: boolean }
+        ) => {
+            try {
+                const outcome = await update(target, transform, options, logging)
+                if (outcome.mayHaveChanged) notify(target.path)
+                return outcome
+            } catch (error) {
+                if (error instanceof FileUpdateError && error.outcome.mayHaveChanged) notify(target.path)
+                throw error
+            }
+        },
+    })
 }

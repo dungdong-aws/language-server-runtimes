@@ -97,7 +97,7 @@ import { getTelemetryReasonDesc } from './util/shared'
 import { writeSync } from 'fs'
 import { format } from 'util'
 import { editCompletionRequestType } from '../protocol/editCompletions'
-import { readFileNoFollow, updateFileNoFollow, logFileAccess } from './util/standalone/guardedFile'
+import { createCheckedFileOperations } from './util/standalone/guardedFile'
 
 // Honor shared aws config file
 if (checkAWSConfigFile()) {
@@ -287,19 +287,9 @@ export const standalone = (props: RuntimeProps) => {
                     lspConnection.sendNotification(didRemoveFileOrDirNotificationType.method, { path: dir })
                 },
                 isFile: path => stat(path).then(({ isFile }) => isFile()),
-                readFileNoFollow: path => readFileNoFollow(path, logging),
-                updateFileNoFollow: async (path, transform, options) => {
-                    await updateFileNoFollow(path, transform, options, logging)
-                    try {
-                        void lspConnection
-                            .sendNotification(didWriteFileNotificationType.method, { path })
-                            .catch(error => {
-                                logFileAccess(logging, 'notification.failed', path, undefined, error)
-                            })
-                    } catch (error) {
-                        logFileAccess(logging, 'notification.failed', path, undefined, error)
-                    }
-                },
+                checkedFiles: createCheckedFileOperations({ debug: message => logging.debug(message) }, path =>
+                    lspConnection.sendNotification(didWriteFileNotificationType.method, { path })
+                ),
                 writeFile: async (path, data, options?) => {
                     await writeFile(path, data, options)
                     lspConnection.sendNotification(didWriteFileNotificationType.method, { path })
