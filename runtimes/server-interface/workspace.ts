@@ -52,6 +52,14 @@ export type Workspace = {
         isFile: (path: string) => Promise<boolean>
         rm: (dir: string, options?: { recursive?: boolean; force?: boolean }) => Promise<void>
         writeFile: (path: string, data: string, options?: { mode?: number | string }) => Promise<void>
+        /** Read UTF-8 content through a checked regular-file handle. */
+        readFileNoFollow?: (path: string) => Promise<string>
+        /** Update a regular file through one checked handle and notify the client on success. */
+        updateFileNoFollow?: (
+            path: string,
+            transform: (content: string) => string,
+            options?: { create?: boolean; readExisting?: boolean }
+        ) => Promise<void>
         appendFile: (path: string, data: string) => Promise<void>
         mkdir: (path: string, options?: { recursive?: boolean }) => Promise<string | undefined>
         /**
