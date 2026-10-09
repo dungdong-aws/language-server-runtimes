@@ -1,5 +1,6 @@
 import { constants, BigIntStats } from 'fs'
 import { open, lstat, FileHandle } from 'fs/promises'
+import { isAbsolute } from 'path'
 import { Logging } from '../../../server-interface/logging'
 import {
     CheckedFileOperations,
@@ -11,7 +12,8 @@ import {
 
 type DebugLogger = Pick<Logging, 'debug'>
 
-export function logFileAccess(
+// Tests parse this shape; keep the `[file-access] <json>` form stable.
+function logFileAccess(
     logging: DebugLogger | undefined,
     event: string,
     targetPath: string,
@@ -55,6 +57,7 @@ function existingTarget(path: string, stat: BigIntStats): ExistingFileTarget {
 }
 
 async function capture(path: string): Promise<CheckedFileTarget> {
+    if (!isAbsolute(path)) throw fileError('EINVAL', `Expected an absolute path: ${path}`)
     try {
         return existingTarget(path, await lstat(path, { bigint: true }))
     } catch (error) {
@@ -87,9 +90,10 @@ async function closeFile(handle: FileHandle, path: string, logging?: DebugLogger
 async function openRegularFile(
     target: CheckedFileTarget,
     flags: number,
-    logging: DebugLogger | undefined,
+    logging?: DebugLogger,
     opened?: () => void
 ): Promise<{ handle: FileHandle; actual: ExistingFileTarget }> {
+    // O_NONBLOCK: a FIFO or device substituted at this path must not block the event loop on open.
     const handle = await open(target.path, flags | constants.O_NOFOLLOW | constants.O_NONBLOCK)
     opened?.()
     logFileAccess(logging, 'open.completed', target.path, handle.fd)
@@ -152,7 +156,7 @@ async function update(
                     transform(options.readExisting === false ? '' : await handle.readFile({ encoding: 'utf8' })),
                     'utf8'
                 )
-            // Transformations run before mutation; writes retain the opened object and use explicit positions.
+            // Write through the verified handle at explicit offsets; the path is never resolved again.
             let offset = 0
             while (offset < content.length) {
                 mayHaveChanged = true
@@ -180,8 +184,8 @@ async function update(
  * Shared by the standalone provider and filesystem integration fixtures.
  *
  * @internal Re-exported from `testing` so consumer test fixtures can run real checked I/O.
- * It is not part of the server-interface contract. Keep it in the published declarations
- * (`stripInternal` stays off) because consumer tests import it.
+ * It is not part of the server-interface contract. The tag is advisory: keep this in the
+ * published declarations because consumer tests import it.
  */
 export function createCheckedFileOperations(
     logging?: DebugLogger,

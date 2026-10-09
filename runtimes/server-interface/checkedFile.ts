@@ -1,4 +1,11 @@
-/** Identity and link count observed together for an existing regular file. */
+/**
+ * Identity and link count observed together for an existing regular file.
+ *
+ * `dev`, `ino`, and `linkCount` are decimal text: `dev` and `ino` can exceed
+ * `Number.MAX_SAFE_INTEGER` and must compare exactly after a JSON round-trip, and the
+ * three fields share one representation. The provider freezes every target it returns;
+ * `Readonly` mirrors that.
+ */
 export type ExistingFileTarget = Readonly<{
     path: string
     state: 'existing'
@@ -96,7 +103,7 @@ export interface CheckedFileOperations {
      * capability name so older consumers fail the presence check instead.
      */
     readonly version: number
-    /** Observe a canonical path without following a final symbolic link. */
+    /** Observe an absolute, canonical path without following a final symbolic link. */
     capture(path: string): Promise<CheckedFileTarget>
     /** Read through a handle matching the captured identity and link-count bound. */
     read(target: CheckedFileTarget): Promise<string>

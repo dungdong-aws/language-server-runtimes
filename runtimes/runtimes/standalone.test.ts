@@ -44,6 +44,7 @@ describe('standalone', () => {
 
     afterEach(() => {
         sinon.restore()
+        // Each standalone() call registers a crash-monitor listener; remove ours so repeated calls stay under MaxListeners.
         for (const listener of process.listeners('uncaughtExceptionMonitor')) {
             if (!initialCrashListeners.includes(listener)) process.removeListener('uncaughtExceptionMonitor', listener)
         }
@@ -229,7 +230,8 @@ describe('standalone', () => {
                     }
                 })
             })
-            ;(process.platform !== 'win32' ? describe : describe.skip)('guarded file operations', () => {
+            // Suite-level skip rather than this.skip(): the hooks themselves do POSIX-only I/O.
+            ;(process.platform !== 'win32' ? describe : describe.skip)('checked file operations', () => {
                 let directory: string
                 let file: string
                 beforeEach(async () => {

@@ -3,10 +3,11 @@ import fs from 'fs/promises'
 import { constants } from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import * as sinon from 'sinon'
-import { createCheckedFileOperations } from './guardedFile'
+import sinon from 'sinon'
+import { createCheckedFileOperations } from './checkedFileOperations'
 import { CheckedFileOperations, CheckedFileTarget, FileUpdateError } from '../../../server-interface/checkedFile'
-;(process.platform !== 'win32' && constants.O_NOFOLLOW ? describe : describe.skip)('guarded file operations', () => {
+// Suite-level skip rather than this.skip(): the hooks themselves do POSIX-only I/O.
+;(process.platform !== 'win32' && constants.O_NOFOLLOW ? describe : describe.skip)('checked file operations', () => {
     let directory: string
     let file: string
     let target: CheckedFileTarget
@@ -159,6 +160,13 @@ import { CheckedFileOperations, CheckedFileTarget, FileUpdateError } from '../..
     it('does not classify permission errors as missing targets', async () => {
         sinon.stub(fs, 'lstat').rejects(Object.assign(new Error('denied'), { code: 'EACCES' }))
         await assert.rejects(operations.capture(file), { code: 'EACCES' })
+    })
+
+    it('rejects relative paths before touching the filesystem', async () => {
+        const lstat = sinon.spy(fs, 'lstat')
+        await assert.rejects(operations.capture('example.txt'), { code: 'EINVAL' })
+        await assert.rejects(operations.capture('./example.txt'), { code: 'EINVAL' })
+        sinon.assert.notCalled(lstat)
     })
 
     it('keeps writing the verified object after the filename changes', async () => {
