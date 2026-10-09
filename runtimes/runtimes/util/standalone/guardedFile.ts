@@ -176,7 +176,13 @@ async function update(
     }
 }
 
-/** Shared by the standalone provider and filesystem integration fixtures. */
+/**
+ * Shared by the standalone provider and filesystem integration fixtures.
+ *
+ * @internal Re-exported from `testing` so consumer test fixtures can run real checked I/O.
+ * It is not part of the server-interface contract. Keep it in the published declarations
+ * (`stripInternal` stays off) because consumer tests import it.
+ */
 export function createCheckedFileOperations(
     logging?: DebugLogger,
     didChange?: (path: string) => void | Promise<void>

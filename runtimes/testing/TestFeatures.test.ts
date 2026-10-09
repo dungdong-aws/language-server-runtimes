@@ -6,6 +6,7 @@ import {
     ExistingFileTarget,
     FileUpdateError,
     FileUpdateOutcome,
+    isFileUpdateError,
 } from '../server-interface'
 import { FileUpdateError as CheckedFileUpdateError } from '../server-interface/checkedFile'
 import { TestFeatures } from './TestFeatures'
@@ -20,11 +21,12 @@ describe('TestFeatures checked files', () => {
     }
     const outcome: FileUpdateOutcome = { mayHaveChanged: true, complete: true, target }
 
-    it('exports the original error class from the public server interface', () => {
+    it('exports the original error class and its guard from the public server interface', () => {
         const cause = Object.assign(new Error('Update failed'), { code: 'EIO' })
         const error = new FileUpdateError(cause, outcome)
         assert.strictEqual(FileUpdateError, CheckedFileUpdateError)
         assert.ok(error instanceof CheckedFileUpdateError)
+        assert.strictEqual(isFileUpdateError(error), true)
         assert.strictEqual(error.cause, cause)
         assert.strictEqual(error.outcome, outcome)
         assert.strictEqual(error.code, 'EIO')

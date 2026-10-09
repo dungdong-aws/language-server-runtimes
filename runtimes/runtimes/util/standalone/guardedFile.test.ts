@@ -296,14 +296,36 @@ import { CheckedFileOperations, CheckedFileTarget, FileUpdateError } from '../..
         sinon.assert.calledOnceWithExactly(notify, missing.path)
     })
 
-    it('isolates failed notification delivery and diagnostics from write outcomes', async () => {
+    const fileAccessEvents = (debug: sinon.SinonStub) =>
+        debug.args.map(([message]) => JSON.parse(String(message).replace(/^\[file-access\] /, '')))
+
+    it('logs notification.failed when asynchronous delivery rejects, without leaking content', async () => {
         const debug = sinon.stub()
-        notify.rejects(new Error('Transport failed'))
+        notify.rejects(Object.assign(new Error('Transport failed'), { code: 'ECONNRESET' }))
         operations = createCheckedFileOperations({ debug }, notify)!
         assert.strictEqual((await operations.update(target, () => 'private-content')).complete, true)
-        await Promise.resolve()
+        // The rejection handler runs on a later microtask than the resolved update.
+        await new Promise(resolve => setImmediate(resolve))
+        const failures = fileAccessEvents(debug).filter(event => event.event === 'notification.failed')
+        assert.deepStrictEqual(failures, [
+            { event: 'notification.failed', targetPath: file, errorName: 'Error', errorCode: 'ECONNRESET' },
+        ])
         assert.ok(!JSON.stringify(debug.args).includes('private-content'))
         assert.ok(!JSON.stringify(debug.args).includes('original fixture'))
+    })
+
+    it('logs notification.failed when synchronous delivery throws', async () => {
+        const debug = sinon.stub()
+        notify.throws(Object.assign(new Error('Transport failed'), { code: 'EPIPE' }))
+        operations = createCheckedFileOperations({ debug }, notify)!
+        assert.strictEqual((await operations.update(target, () => 'next')).complete, true)
+        const failures = fileAccessEvents(debug).filter(event => event.event === 'notification.failed')
+        assert.deepStrictEqual(failures, [
+            { event: 'notification.failed', targetPath: file, errorName: 'Error', errorCode: 'EPIPE' },
+        ])
+    })
+
+    it('completes the update when both notification delivery and the logger throw', async () => {
         operations = createCheckedFileOperations(
             {
                 debug: () => {
